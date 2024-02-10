@@ -18,12 +18,15 @@ limitations under the License.
 package walk
 
 import (
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/bazelbuild/bazel-gazelle/config"
 	"github.com/bazelbuild/bazel-gazelle/rule"
@@ -107,7 +110,7 @@ type WalkFunc func(dir, rel string, c *config.Config, update bool, f *rule.File,
 // to the wf callback should be set.
 //
 // wf is a function that may be called in each directory.
-func Walk(c *config.Config, cexts []config.Configurer, dirs []string, mode Mode, wf WalkFunc) {
+func Walk(rootConfig *config.Config, cexts []config.Configurer, dirs []string, mode Mode, wf WalkFunc) {
 	knownDirectives := make(map[string]bool)
 	for _, cext := range cexts {
 		for _, d := range cext.KnownDirectives() {
@@ -115,22 +118,42 @@ func Walk(c *config.Config, cexts []config.Configurer, dirs []string, mode Mode,
 		}
 	}
 
-	updateRels := buildUpdateRelMap(c.RepoRoot, dirs)
+	updateRels := buildUpdateRelMap(rootConfig.RepoRoot, dirs)
 
-	var visit func(*config.Config, string, string, bool)
-	visit = func(c *config.Config, dir, rel string, updateParent bool) {
-		haveError := false
+	var mu sync.Mutex
+	updateParents := map[string]struct{}{}
+	parentConfigs := map[string]*config.Config{}
 
-		// TODO: OPT: ReadDir stats all the files, which is slow. We just care about
-		// names and modes, so we should use something like
-		// golang.org/x/tools/internal/fastwalk to speed this up.
-		ents, err := os.ReadDir(dir)
-		if err != nil {
-			log.Print(err)
-			return
+	parentConfigs["."] = rootConfig
+
+	var haveError atomic.Bool
+
+	// visit = func(c *config.Config, dir, rel string, updateParent bool) {
+	ParallelWalk(rootConfig.RepoRoot, func(path string, files []fs.DirEntry) error {
+		rel := path[len(rootConfig.RepoRoot):]
+		parent := filepath.Dir(rel)
+
+		mu.Lock()
+		_, updateParent := updateParents[parent]
+		c := parentConfigs[parent]
+		mu.Unlock()
+
+		if c == nil {
+			panic(fmt.Sprintf("NIL!!!! '%s' '%s' %v", rel, parent, parentConfigs))
 		}
 
-		f, err := loadBuildFile(c, rel, dir, ents)
+		shouldUpdate := shouldUpdate(rel, mode, updateParent, updateRels)
+		if shouldUpdate {
+			mu.Lock()
+			updateParents[rel] = struct{}{}
+			mu.Unlock()
+		}
+
+		if !shouldVisit(rel, mode, shouldUpdate, updateRels) {
+			return fs.SkipDir
+		}
+
+		f, err := loadBuildFile(c, rel, path, files)
 		if err != nil {
 			log.Print(err)
 			if c.Strict {
@@ -138,20 +161,24 @@ func Walk(c *config.Config, cexts []config.Configurer, dirs []string, mode Mode,
 				// Refactor to accumulate and propagate errors to main.
 				log.Fatal("Exit as strict mode is on")
 			}
-			haveError = true
+			haveError.Store(true)
 		}
 
 		c = configure(cexts, knownDirectives, c, rel, f)
+		mu.Lock()
+		parentConfigs[rel] = c
+		mu.Unlock()
+
 		wc := getWalkConfig(c)
 
 		if wc.isExcluded(rel, ".") {
-			return
+			return filepath.SkipDir
 		}
 
 		var subdirs, regularFiles []string
-		for _, ent := range ents {
+		for _, ent := range files {
 			base := ent.Name()
-			ent := resolveFileInfo(wc, dir, rel, ent)
+			ent := resolveFileInfo(wc, path, rel, ent)
 			switch {
 			case ent == nil:
 				continue
@@ -162,20 +189,13 @@ func Walk(c *config.Config, cexts []config.Configurer, dirs []string, mode Mode,
 			}
 		}
 
-		shouldUpdate := shouldUpdate(rel, mode, updateParent, updateRels)
-		for _, sub := range subdirs {
-			if subRel := path.Join(rel, sub); shouldVisit(subRel, mode, shouldUpdate, updateRels) {
-				visit(c, filepath.Join(dir, sub), subRel, shouldUpdate)
-			}
-		}
-
-		update := !haveError && !wc.ignore && shouldUpdate
+		update := !haveError.Load() && !wc.ignore && shouldUpdate
 		if shouldCall(rel, mode, updateParent, updateRels) {
 			genFiles := findGenFiles(wc, f)
-			wf(dir, rel, c, update, f, subdirs, regularFiles, genFiles)
+			wf(path, rel, c, update, f, subdirs, regularFiles, genFiles)
 		}
-	}
-	visit(c, c.RepoRoot, "", false)
+		return nil
+	})
 }
 
 // buildUpdateRelMap builds a table of prefixes, used to determine which
@@ -250,10 +270,10 @@ func shouldVisit(rel string, mode Mode, updateParent bool, updateRels map[string
 	}
 }
 
-func loadBuildFile(c *config.Config, pkg, dir string, ents []fs.DirEntry) (*rule.File, error) {
+func loadBuildFile(c *config.Config, pkg, dir string, files []fs.DirEntry) (*rule.File, error) {
 	var err error
 	readDir := dir
-	readEnts := ents
+	readEnts := files
 	if c.ReadBuildFilesDir != "" {
 		readDir = filepath.Join(c.ReadBuildFilesDir, filepath.FromSlash(pkg))
 		readEnts, err = os.ReadDir(readDir)

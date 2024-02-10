@@ -125,5 +125,6 @@ GO_REPOSITORY_TOOLS_SRCS = [
     Label("//tools/releaser:main.go"),
     Label("//walk:BUILD.bazel"),
     Label("//walk:config.go"),
+    Label("//walk:parallel_walk.go"),
     Label("//walk:walk.go"),
 ]
